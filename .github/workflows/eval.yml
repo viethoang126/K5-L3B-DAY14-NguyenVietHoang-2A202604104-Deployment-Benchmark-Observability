@@ -1,0 +1,29 @@
+# Quality gate: PR chỉ qua khi eval agent v2 đạt yêu cầu.
+# run_eval.py trả exit code 1 khi accuracy < --min-accuracy → bước này fail → job fail.
+name: quality-gate
+
+on:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  eval:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: 06-lab-complete/benchmark-observability/develop
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install -r requirements.txt
+      - name: Run agent + eval
+        env:
+          MOCK_ERROR_RATE: "0"    # bỏ lỗi ngẫu nhiên để gate không fail oan
+        run: |
+          AGENT_VERSION=v2 PORT=8000 python app.py > agent.log 2>&1 &
+          curl --retry 20 --retry-delay 1 --retry-connrefused -sf http://127.0.0.1:8000/health
+          python eval/run_eval.py --url http://127.0.0.1:8000 --min-accuracy 0.85
