@@ -1,9 +1,9 @@
 # Benchmark & Observability Report — Day 14
 
-> Mọi con số lấy từ report JSON trong `reports/`. Mục 4–6 thuộc Part 7 Bước 2 (Docker stack), **chưa làm**.
+> Số liệu mục 2–3 lấy từ JSON trong `reports/`, mục 5 từ CSV trong `benchmark-results/`, mục 4 từ truy vấn Prometheus, log và Jaeger của stack Docker.
 
 **Họ tên:** NguyenVietHoang
-**Ngày chạy:** 2026-11-26 (Part 7 Bước 1)
+**Ngày chạy:** 2026-11-26
 **Môi trường:** Windows 11, Intel i5-13420H (12 luồng), RAM 15.7 GB, Python 3.12.10. Agent chạy trực tiếp trên máy (1 process uvicorn), máy tạo tải cũng là máy này. Gọi qua `127.0.0.1` để tránh độ trễ khi Windows thử IPv6 trước với `localhost`. Đặt `PYTHONUTF8=1` để script đọc và ghi JSON bằng UTF-8.
 
 ---
@@ -93,24 +93,38 @@ Chỉ sửa `develop/utils/mock_llm.py`, không sửa golden dataset. Eval chấ
 
 ### 4.1 Screenshot
 
-- [ ] Dashboard Grafana khi đang có tải (thấy rõ Golden Signals)
-- [ ] Một trace chậm trong Jaeger (thấy span nào chiếm thời gian)
-- [ ] Một trace lỗi trong Jaeger (có event `exception`)
-- [ ] Trang Alerts của Prometheus với ít nhất 1 alert đang **firing**
+- [x] [Dashboard Grafana khi đang có tải](screenshots/grafana-dashboard.png)
+- [x] [Trace chậm trong Jaeger](screenshots/jaeger-slow-trace.png)
+- [x] [Trace lỗi trong Jaeger, có event `exception`](screenshots/jaeger-error-trace.png)
+- [x] [Trang Alerts của Prometheus, 2 alert cùng firing](screenshots/prometheus-alert-firing.png)
+
+Stack chạy bằng `docker compose -p k5-day14-observability`. Ảnh mục này được chụp tự động bằng Chrome ở chế độ headless (Playwright). Unit test alert rule (`promtool test rules`) cho kết quả `SUCCESS`.
 
 ### 4.2 Thí nghiệm "phá hệ thống"
 
-| # | Thay đổi | Alert nào firing | Thời gian từ lúc đổi → firing | Panel nào phản ánh rõ nhất |
+Tải nền: Locust 30 user, 2 instance. Một script áp dụng thay đổi, hỏi API alert của Prometheus mỗi 3 giây và ghi thời gian. Mốc 0 là ngay trước khi chạy lệnh đổi cấu hình, nên thời gian gồm cả lúc tạo lại container.
+
+| # | Thay đổi | Alert nào firing | Thời gian từ lúc đổi → firing | Panel / chỉ số phản ánh rõ nhất |
 |---|---|---|---|---|
-| A | `MOCK_ERROR_RATE=0.2` | | | |
-| B | `MOCK_SLOW_RATE=0.3` | | | |
-| C | `LLM_MODEL=mock-llm-large` | | | |
-| D | `docker pause` 1 instance | | | |
-| E | `AGENT_VERSION=v1` | | | |
+| A | `MOCK_ERROR_RATE=0.2` | `AgentHighErrorRate` | 81 s (pending sau 24 s) | Error rate: 0.88% → 22.6% |
+| B | `MOCK_SLOW_RATE=0.3` (bật khi A **vẫn đang bật**) | `AgentHighLatencyP95` | 141 s (pending sau 21 s) | p95: 0.29 → 1.90 s; avg: 0.21 → 0.59 s |
+| C | `LLM_MODEL=mock-llm-large` | Không chạy | — | — |
+| D | `docker pause` 1 instance (A và B vẫn đang bật) | `AgentInstanceDown` | 39 s (pending sau 9 s) | Instances up: 2 → 1; log Nginx có 27 mã 504 |
+| E | `AGENT_VERSION=v1` (các biến khác về mặc định) | Không có alert mới trong 150 s | — | Retrieval không còn series; bảng version đổi sang v1 |
+
+**Phân tích:**
+- **A và B:** thời gian tới firing gồm thời gian để cửa sổ `rate(...[1m])` vượt ngưỡng, cộng `for` (1 phút với error rate, 2 phút với latency). `for` giúp không báo động vì spike ngắn, đổi lại phát hiện chậm hơn. Lúc chụp ảnh, cả hai alert cùng firing.
+- **B:** avg tăng ít hơn p95 nhiều, nên alert đặt theo p95 nhạy hơn.
+- **D và mã 504:** 504 do Nginx sinh ra khi chờ instance bị pause. Metric của agent chỉ đếm response mà agent tạo ra, nên không đếm các mã 504 này. Trong lần chạy này error rate của agent vốn đã cao do A (21.9%), nên tôi **không quan sát được** trường hợp panel này vẫn xanh. Cần giám sát thêm ở load balancer hoặc kiểm tra từ bên ngoài. `docker pause` tạo được alert vì container vẫn còn trong DNS; container bị `stop` biến khỏi DNS thì Prometheus không còn target để báo down.
+- **`LLMCostBurnRateHigh` đã firing trước thí nghiệm** (`activeAt` 23:31:42 giờ địa phương), sau bài scaling 100 user. Với tải nền 30 user và model nhỏ, truy vấn đo được 3.1–4.3 USD/giờ, vẫn trên ngưỡng 2 USD/giờ. Alert tắt trong lúc chạy A và B, khi chi phí đo được xuống dưới 2 USD/giờ (1.74). Vậy ngưỡng này phụ thuộc lượng tải; nên theo dõi thêm cost cho mỗi request. Do alert đã firing từ nền, tôi không chạy C.
 
 **Thí nghiệm E không làm alert nào firing. Bạn sẽ phát hiện loại sự cố này trong production bằng cách nào?**
 
-...
+Trên metric hạ tầng, v1 trông còn "khoẻ": sau 150 s, error rate 0.86%, p95 198 ms (baseline 295 ms), tokens/s input/output giảm từ 1445/763 xuống 688/376 và chi phí giảm. Trong khi đó eval ở mục 3 cho thấy accuracy của v1 chỉ 4.3% so với 91.3% của v2. Để phát hiện:
+- Chạy eval trên golden dataset làm quality gate **trước khi deploy**.
+- Chạy eval định kỳ trên bản đang chạy và alert khi accuracy giảm.
+- Thêm tín hiệu chất lượng vào metric: tỉ lệ retrieval hit và alert khi series này **biến mất** (`absent(...)`), phản hồi của người dùng, chấm mẫu traffic thật.
+- Alert hoặc đánh dấu trên dashboard khi `agent_info` đổi version.
 
 ### 4.3 Debug bằng trace
 
@@ -178,12 +192,15 @@ Tải: Locust 30 user, 2 instance. Số truy vấn từ Prometheus lúc 23:37:36
 ## 6. Kết luận
 
 - 3 điều bạn học được về benchmark & observability:
-  1. ...
-  2. ...
-  3. ...
+  1. Percentile phải chọn theo tỉ lệ request chậm cần phát hiện: với 3% request chậm, p99 thấy còn p95 và avg gần như không thấy (mục 2.2).
+  2. Dashboard hạ tầng xanh không có nghĩa agent trả lời đúng: v1 có error rate và p95 tốt nhưng accuracy 4.3% (thí nghiệm E).
+  3. Metric cho biết có vấn đề, trace cho biết chậm ở bước nào (98.7% ở lời gọi LLM), còn log cùng `trace_id` cho biết chi tiết. Mỗi loại chỉ trả lời một phần.
 - Nếu đưa agent này lên production thật, bạn sẽ thêm metric / alert nào nữa?
-
-...
+  - Tỉ lệ 5xx và latency đo ở Nginx / load balancer, cùng synthetic check từ bên ngoài, để thấy lỗi 504.
+  - Alert p99, vì alert p95 bỏ sót trường hợp ít hơn 5% request chậm.
+  - Điểm eval định kỳ, tỉ lệ retrieval hit (kèm `absent`) và thay đổi version.
+  - Cost cho mỗi request, bên cạnh cost mỗi giờ.
+  - Ghi log lỗi ở mức `ERROR` thay vì `INFO`.
 
 ---
 
